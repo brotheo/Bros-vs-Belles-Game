@@ -23,6 +23,7 @@
   }
   .group-name{font-size:15px; letter-spacing:0.08em; color:var(--gold); margin-bottom:6px;}
   .house-tag{font-size:12px; color:var(--text-dim); margin-bottom:26px;}
+  .hint-legend{font-size:11px; color:var(--cyan); letter-spacing:0.04em; margin-top:-16px; margin-bottom:18px;}
   .category-tag{font-size:12px; letter-spacing:0.08em; color:var(--cyan); margin-bottom:10px;}
   .question-text{font-size:19px; font-weight:700; line-height:1.4; margin-bottom:22px; padding:0 4px;}
   .options{display:flex; flex-direction:column; gap:12px; width:100%; max-width:400px;}
@@ -34,23 +35,27 @@
   button.opt:active{transform:scale(0.98);}
   button.opt:disabled{opacity:0.5;}
   button.opt.picked{border-color:var(--gold); color:var(--gold);}
+  button.opt.hint{box-shadow:0 0 0 2px var(--cyan) inset;}
   .feedback{margin-top:22px; font-size:16px; min-height:24px;}
   .feedback.good{color:var(--good);}
   .feedback.bad{color:var(--bad);}
   .waiting{color:var(--text-dim); font-size:15px; margin-top:40px;}
+  .rep-timer{font-size:15px; color:var(--text-dim); margin-top:20px;}
+  .rep-timer.urgent{color:var(--bad); font-weight:700;}
 </style>
 </head>
 <body>
 
 <div class="group-name" id="group-name">Loading…</div>
 <div class="house-tag" id="house-tag"></div>
+<div class="hint-legend">A glowing outline = your audience's top pick</div>
 
 <div id="game-area">
   <div class="waiting">Waiting for the host to start...</div>
 </div>
 
 <script>
-  const API_URL = "https://script.google.com/macros/s/AKfycbzS09lrmvKGGKp3sWrtwzYvVulTpUuKHQhfg9JguukSZZObG5bfmQfL6M1Wpjw0HmViaw/exec";
+  const API_URL = "https://script.google.com/macros/s/AKfycbx6Kld__OZRwbr3pk8Ry5-phh565VkTAzQugDnSQ5oKUAssenkCH28NOW1hxoRkeT8s-g/exec";
   const params = new URLSearchParams(window.location.search);
   const groupId = params.get('group') || '';
 
@@ -131,6 +136,7 @@
       <div class="question-text">${state.question.question}</div>
       <div class="options" id="options"></div>
       <div class="feedback" id="feedback"></div>
+      <div class="rep-timer" id="rep-timer"></div>
     `;
     const optsDiv = document.getElementById('options');
     state.question.options.forEach(opt => {
@@ -139,6 +145,32 @@
       btn.textContent = opt;
       btn.onclick = () => pickAnswer(opt, btn);
       optsDiv.appendChild(btn);
+    });
+  }
+
+  function updateTimer(state){
+    const el = document.getElementById('rep-timer');
+    if(!el || !state.round_active || !state.start_time) return;
+    const elapsed = (Date.now() - Number(state.start_time)) / 1000;
+    const remaining = Math.max(0, Math.ceil(state.duration_seconds - elapsed));
+    el.textContent = remaining + 's left';
+    el.classList.toggle('urgent', remaining <= 5);
+  }
+
+  function lockOutForOtherAnswer(displayName){
+    hasAnswered = true;
+    document.querySelectorAll('.opt').forEach(b=>b.disabled=true);
+    playWrong();
+    const fb = document.getElementById('feedback');
+    if(fb){
+      fb.textContent = (displayName || 'The other side') + ' already locked in the answer!';
+      fb.className = 'feedback bad';
+    }
+  }
+
+  function applyHint(hintText){
+    document.querySelectorAll('.opt').forEach(btn => {
+      btn.classList.toggle('hint', !!hintText && btn.textContent === hintText);
     });
   }
 
@@ -156,7 +188,24 @@
       }
       return;
     }
+
+    if(state.question.id !== currentQuestionId){
+      hasAnswered = false;
+    }
+
     renderQuestion(state);
+
+    if(state.locked_by && state.locked_by !== groupId && !hasAnswered){
+      const winner = (state.groups || []).find(g => g.group_id === state.locked_by);
+      lockOutForOtherAnswer(winner ? winner.display_name : null);
+    }
+
+    if(!hasAnswered && me && state.audience_hint){
+      applyHint(state.audience_hint[me.house]);
+    }
+    if(!hasAnswered){
+      updateTimer(state);
+    }
   }
 
   poll();

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audience Hint QR Codes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root{ --bros:#3d92e8; --belles:#e8399c; --text:#111; --dim:#666; }
+  *{box-sizing:border-box;}
+  body{font-family:'Cinzel', serif; padding:30px; color:var(--text); background:#fff;}
+  h1{font-size:22px; margin-bottom:8px; text-align:center;}
+  .subtitle{text-align:center; font-size:13px; color:var(--dim); margin-bottom:24px;}
+  .grid{display:grid; grid-template-columns:repeat(2, 1fr); gap:24px; max-width:600px; margin:0 auto;}
+  .card{border:1px solid #ddd; border-radius:8px; padding:20px; text-align:center; page-break-inside:avoid;}
+  .card.bros{border-top:4px solid var(--bros);}
+  .card.belles{border-top:4px solid var(--belles);}
+  .card h2{font-size:18px; margin-bottom:12px;}
+  .card.bros h2{color:var(--bros);}
+  .card.belles h2{color:var(--belles);}
+  .card img{width:220px; height:220px;}
+  .card p{font-size:12px; color:var(--dim); margin-top:10px; word-break:break-all;}
+  @media print{ body{padding:0;} }
+</style>
+</head>
+<body>
+
+<h1>Bros. vs. Belles — Audience Hint Voting</h1>
+<div class="subtitle">Scan to help your representative on stage — doesn't affect the score.</div>
+<div class="grid" id="grid"></div>
+
+<script>
+  const AUDIENCE_PAGE_URL = "PASTE_YOUR_HOSTED_AUDIENCE_PAGE_URL_HERE";
+
+  const audiences = [
+    { name: 'Bros Audience', house: 'bros' },
+    { name: 'Belles Audience', house: 'belles' }
+  ];
+
+  const grid = document.getElementById('grid');
+  audiences.forEach(a => {
+    const link = AUDIENCE_PAGE_URL + '?house=' + encodeURIComponent(a.house);
+    const qrSrc = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(link);
+    const card = document.createElement('div');
+    card.className = 'card ' + a.house;
+    card.innerHTML = `
+      <h2>${a.name}</h2>
+      <img src="${qrSrc}" alt="QR code for ${a.name}">
+      <p>${link}</p>
+    `;
+    grid.appendChild(card);
+  });
+</script>
+
+</body>
+</html>

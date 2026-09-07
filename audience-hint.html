@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bros. vs. Belles — Audience Hint</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#08080b; --panel:#111116; --line:#1c1c22;
+    --cyan:#3ddbe8; --gold:#e8c778; --bros:#3d92e8; --belles:#e8399c;
+    --text:#f2f1ec; --text-dim:#8a8a92;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{height:100%;}
+  body{
+    background: radial-gradient(ellipse at 50% 30%, #101015 0%, #08080b 70%);
+    color:var(--text); font-family:'Cinzel', serif;
+    min-height:100vh; display:flex; flex-direction:column; align-items:center;
+    padding:22px; text-align:center;
+  }
+  .house-title{font-size:16px; letter-spacing:0.08em; margin-bottom:4px;}
+  .house-title.bros{color:var(--bros);}
+  .house-title.belles{color:var(--belles);}
+  .subtitle{font-size:12px; color:var(--text-dim); margin-bottom:26px;}
+  .category-tag{font-size:12px; letter-spacing:0.08em; color:var(--cyan); margin-bottom:10px;}
+  .question-text{font-size:19px; font-weight:700; line-height:1.4; margin-bottom:22px; padding:0 4px;}
+  .options{display:flex; flex-direction:column; gap:12px; width:100%; max-width:400px;}
+  button.opt{
+    font-family:'Cinzel', serif; font-size:16px; color:var(--text);
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:16px 10px; cursor:pointer;
+  }
+  button.opt:active{transform:scale(0.98);}
+  button.opt.picked{border-color:var(--gold); color:var(--gold);}
+  .feedback{margin-top:22px; font-size:14px; color:var(--text-dim); min-height:20px;}
+  .waiting{color:var(--text-dim); font-size:15px; margin-top:40px;}
+  .rep-timer{font-size:13px; color:var(--text-dim); margin-top:16px;}
+  .rep-timer.urgent{color:var(--belles); font-weight:700;}
+  .closed-msg{color:var(--gold); font-size:16px; margin-top:40px;}
+</style>
+</head>
+<body>
+
+<div class="house-title" id="house-title">Loading…</div>
+<div class="subtitle">Vote to help your representative on stage. This does not affect the score.</div>
+
+<div id="game-area">
+  <div class="waiting">Waiting for the host to start...</div>
+</div>
+
+<script>
+  const API_URL = "https://script.google.com/macros/s/AKfycbx6Kld__OZRwbr3pk8Ry5-phh565VkTAzQugDnSQ5oKUAssenkCH28NOW1hxoRkeT8s-g/exec";
+  const params = new URLSearchParams(window.location.search);
+  const house = (params.get('house') || '').toLowerCase() === 'belles' ? 'Belles' : 'Bros';
+
+  document.getElementById('house-title').textContent = house + ' Audience';
+  document.getElementById('house-title').className = 'house-title ' + house.toLowerCase();
+
+  function getVoterId(){
+    let id = localStorage.getItem('bvb_voter_id');
+    if(!id){
+      id = 'v-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+      localStorage.setItem('bvb_voter_id', id);
+    }
+    return id;
+  }
+  const voterId = getVoterId();
+
+  let currentQuestionId = null;
+  let myPick = null;
+
+  async function api(paramsObj){
+    const url = API_URL + '?' + new URLSearchParams(paramsObj).toString();
+    const res = await fetch(url);
+    return res.json();
+  }
+
+  async function pickOption(option, btnEl){
+    myPick = option;
+    document.querySelectorAll('.opt').forEach(b => b.classList.remove('picked'));
+    btnEl.classList.add('picked');
+    document.getElementById('feedback').textContent = 'Vote counted — you can change it anytime.';
+    await api({ action: 'submitVote', house: house, voter_id: voterId, choice: option });
+  }
+
+  function renderQuestion(state){
+    const area = document.getElementById('game-area');
+    if(state.question.id !== currentQuestionId){
+      currentQuestionId = state.question.id;
+      myPick = null;
+    }
+
+    area.innerHTML = `
+      <div class="category-tag">${state.question.category}</div>
+      <div class="question-text">${state.question.question}</div>
+      <div class="options" id="options"></div>
+      <div class="feedback" id="feedback">${myPick ? 'Vote counted — you can change it anytime.' : ''}</div>
+      <div class="rep-timer" id="rep-timer"></div>
+    `;
+    const optsDiv = document.getElementById('options');
+    state.question.options.forEach(opt => {
+      const btn = document.createElement('button');
+      btn.className = 'opt' + (opt === myPick ? ' picked' : '');
+      btn.textContent = opt;
+      btn.onclick = () => pickOption(opt, btn);
+      optsDiv.appendChild(btn);
+    });
+  }
+
+  function updateTimer(state){
+    const el = document.getElementById('rep-timer');
+    if(!el || !state.round_active || !state.start_time) return;
+    const elapsed = (Date.now() - Number(state.start_time)) / 1000;
+    const remaining = Math.max(0, Math.ceil(state.duration_seconds - elapsed));
+    el.textContent = remaining + 's left to vote';
+    el.classList.toggle('urgent', remaining <= 5);
+  }
+
+  let lastLockedBy = '';
+  function showClosedForVote(displayName){
+    document.getElementById('game-area').innerHTML =
+      `<div class="closed-msg">${displayName || 'Your representative'} already answered — voting closed!</div>`;
+  }
+
+  async function poll(){
+    let state;
+    try{ state = await api({action:'getState'}); } catch(e){ return; }
+
+    if(!state.round_active || !state.question){
+      document.getElementById('game-area').innerHTML = '<div class="waiting">Waiting for the next question...</div>';
+      currentQuestionId = null;
+      myPick = null;
+      lastLockedBy = '';
+      return;
+    }
+
+    if(state.question.id !== currentQuestionId){
+      lastLockedBy = '';
+    }
+
+    const ownRepLocked = state.locked_by && (state.groups || []).find(g => g.group_id === state.locked_by && g.house === house);
+
+    if(ownRepLocked){
+      if(state.locked_by !== lastLockedBy){
+        lastLockedBy = state.locked_by;
+        showClosedForVote(ownRepLocked.display_name);
+      }
+      return;
+    }
+
+    renderQuestion(state);
+    updateTimer(state);
+  }
+
+  poll();
+  setInterval(poll, 1000);
+</script>
+
+</body>
+</html>
