@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bros. vs. Belles — Answer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#08080b; --panel:#111116; --line:#1c1c22;
+    --cyan:#3ddbe8; --gold:#e8c778; --good:#5fd18a; --bad:#e8399c;
+    --text:#f2f1ec; --text-dim:#8a8a92;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{height:100%;}
+  body{
+    background: radial-gradient(ellipse at 50% 30%, #101015 0%, #08080b 70%);
+    color:var(--text); font-family:'Cinzel', serif;
+    min-height:100vh; display:flex; flex-direction:column; align-items:center;
+    padding:22px; text-align:center;
+  }
+  .group-name{font-size:15px; letter-spacing:0.08em; color:var(--gold); margin-bottom:6px;}
+  .house-tag{font-size:12px; color:var(--text-dim); margin-bottom:26px;}
+  .category-tag{font-size:12px; letter-spacing:0.08em; color:var(--cyan); margin-bottom:10px;}
+  .question-text{font-size:19px; font-weight:700; line-height:1.4; margin-bottom:22px; padding:0 4px;}
+  .options{display:flex; flex-direction:column; gap:12px; width:100%; max-width:400px;}
+  button.opt{
+    font-family:'Cinzel', serif; font-size:16px; color:var(--text);
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:16px 10px; cursor:pointer;
+  }
+  button.opt:active{transform:scale(0.98);}
+  button.opt:disabled{opacity:0.5;}
+  button.opt.picked{border-color:var(--gold); color:var(--gold);}
+  .feedback{margin-top:22px; font-size:16px; min-height:24px;}
+  .feedback.good{color:var(--good);}
+  .feedback.bad{color:var(--bad);}
+  .waiting{color:var(--text-dim); font-size:15px; margin-top:40px;}
+</style>
+</head>
+<body>
+
+<div class="group-name" id="group-name">Loading…</div>
+<div class="house-tag" id="house-tag"></div>
+
+<div id="game-area">
+  <div class="waiting">Waiting for the host to start...</div>
+</div>
+
+<script>
+  const API_URL = "https://script.google.com/macros/s/AKfycbzS09lrmvKGGKp3sWrtwzYvVulTpUuKHQhfg9JguukSZZObG5bfmQfL6M1Wpjw0HmViaw/exec";
+  const params = new URLSearchParams(window.location.search);
+  const groupId = params.get('group') || '';
+
+  let muted = false;
+  let audioCtx = null;
+  let currentQuestionId = null;
+  let hasAnswered = false;
+
+  function getCtx(){
+    if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if(audioCtx.state === 'suspended') audioCtx.resume();
+    return audioCtx;
+  }
+  function tone(ctx, freq, t, dur, type, peak){
+    const osc = ctx.createOscillator(); const gain = ctx.createGain();
+    osc.type = type; osc.frequency.setValueAtTime(freq, t);
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(peak, t + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t); osc.stop(t + dur + 0.02);
+  }
+  function playCorrect(){
+    const ctx = getCtx(); const t = ctx.currentTime;
+    tone(ctx,523.25,t,0.16,'sine',0.22);
+    tone(ctx,659.25,t+0.10,0.16,'sine',0.22);
+    tone(ctx,783.99,t+0.20,0.28,'sine',0.24);
+  }
+  function playWrong(){
+    const ctx = getCtx(); const t = ctx.currentTime;
+    tone(ctx,196.00,t,0.30,'sawtooth',0.16);
+    tone(ctx,146.83,t+0.16,0.34,'sawtooth',0.16);
+  }
+
+  async function api(paramsObj){
+    const url = API_URL + '?' + new URLSearchParams(paramsObj).toString();
+    const res = await fetch(url);
+    return res.json();
+  }
+
+  async function pickAnswer(choice, btnEl){
+    if(hasAnswered) return;
+    hasAnswered = true;
+    document.querySelectorAll('.opt').forEach(b=>b.disabled=true);
+    btnEl.classList.add('picked');
+
+    const result = await api({action:'submitAnswer', group: groupId, choice: choice});
+    const fb = document.getElementById('feedback');
+
+    if(result.ok && result.result === 'correct'){
+      playCorrect();
+      fb.textContent = "You got it! +100";
+      fb.className = 'feedback good';
+    } else if(result.reason === 'already_answered'){
+      playWrong();
+      fb.textContent = "Someone already locked in that one!";
+      fb.className = 'feedback bad';
+    } else {
+      playWrong();
+      fb.textContent = "Locked in — waiting on the others.";
+      fb.className = 'feedback bad';
+    }
+  }
+
+  function renderQuestion(state){
+    const area = document.getElementById('game-area');
+    if(state.question.id !== currentQuestionId){
+      currentQuestionId = state.question.id;
+      hasAnswered = false;
+    }
+
+    if(hasAnswered){
+      return;
+    }
+
+    area.innerHTML = `
+      <div class="category-tag">${state.question.category}</div>
+      <div class="question-text">${state.question.question}</div>
+      <div class="options" id="options"></div>
+      <div class="feedback" id="feedback"></div>
+    `;
+    const optsDiv = document.getElementById('options');
+    state.question.options.forEach(opt => {
+      const btn = document.createElement('button');
+      btn.className = 'opt';
+      btn.textContent = opt;
+      btn.onclick = () => pickAnswer(opt, btn);
+      optsDiv.appendChild(btn);
+    });
+  }
+
+  async function poll(){
+    let state;
+    try{ state = await api({action:'getState'}); } catch(e){ return; }
+
+    const me = (state.groups || []).find(g => g.group_id === groupId);
+    document.getElementById('group-name').textContent = me ? me.display_name : ('Unknown group: ' + groupId);
+    document.getElementById('house-tag').textContent = me ? (me.house + ' house · ' + me.score + ' pts') : '';
+
+    if(!state.round_active || !state.question){
+      if(!hasAnswered){
+        document.getElementById('game-area').innerHTML = '<div class="waiting">Waiting for the next question...</div>';
+      }
+      return;
+    }
+    renderQuestion(state);
+  }
+
+  poll();
+  setInterval(poll, 1000);
+</script>
+
+</body>
+</html>
