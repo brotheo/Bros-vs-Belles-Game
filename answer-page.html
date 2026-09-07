@@ -63,6 +63,7 @@
   let audioCtx = null;
   let currentQuestionId = null;
   let hasAnswered = false;
+  let localStartTime = null;
 
   function getCtx(){
     if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -125,6 +126,7 @@
     if(state.question.id !== currentQuestionId){
       currentQuestionId = state.question.id;
       hasAnswered = false;
+      localStartTime = Date.now();
     }
 
     if(hasAnswered){
@@ -150,8 +152,8 @@
 
   function updateTimer(state){
     const el = document.getElementById('rep-timer');
-    if(!el || !state.round_active || !state.start_time) return;
-    const elapsed = (Date.now() - Number(state.start_time)) / 1000;
+    if(!el || !state.round_active || !localStartTime) return;
+    const elapsed = (Date.now() - localStartTime) / 1000;
     const remaining = Math.max(0, Math.ceil(state.duration_seconds - elapsed));
     el.textContent = remaining + 's left';
     el.classList.toggle('urgent', remaining <= 5);

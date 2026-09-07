@@ -166,16 +166,16 @@
   async function startGame(){
     advancing = false;
     if(advanceTimeoutId){ clearTimeout(advanceTimeoutId); advanceTimeoutId = null; }
-    await api({action:'nextQuestion'});
-    poll();
+    const state = await api({action:'nextQuestion'});
+    render(state);
     if(!pollTimer) pollTimer = setInterval(poll, 1000);
   }
 
   async function skipQuestion(){
     advancing = false;
     if(advanceTimeoutId){ clearTimeout(advanceTimeoutId); advanceTimeoutId = null; }
-    await api({action:'nextQuestion'});
-    poll();
+    const state = await api({action:'nextQuestion'});
+    render(state);
     if(!pollTimer) pollTimer = setInterval(poll, 1000);
   }
 
@@ -185,6 +185,7 @@
     await api({action:'resetGame'});
     lastQuestionId = null;
     lastLockedBy = '';
+    localStartTime = null;
     document.getElementById('q-counter').textContent = '';
     document.getElementById('category').textContent = 'waiting to start';
     document.getElementById('question-text').textContent = 'Click "Start game" to begin';
@@ -218,11 +219,15 @@
   }
 
   let lastQuestionId = null;
+  let localStartTime = null;
 
   async function poll(){
     let state;
     try{ state = await api({action:'getState'}); } catch(e){ return; }
+    render(state);
+  }
 
+  function render(state){
     if(!state.question){
       renderGroups(state.groups || []);
       return;
@@ -230,6 +235,7 @@
 
     if(state.question.id !== lastQuestionId){
       lastQuestionId = state.question.id;
+      localStartTime = Date.now();
       document.getElementById('bros-check').classList.remove('hit');
       document.getElementById('belles-check').classList.remove('hit');
       document.getElementById('status').textContent = '';
@@ -255,8 +261,8 @@
     const timerEl = document.getElementById('timer');
     const barEl = document.getElementById('timer-bar');
 
-    if(state.round_active && state.start_time){
-      const elapsed = (Date.now() - Number(state.start_time)) / 1000;
+    if(state.round_active && localStartTime){
+      const elapsed = (Date.now() - localStartTime) / 1000;
       const remaining = Math.max(0, Math.ceil(state.duration_seconds - elapsed));
       const pct = Math.max(0, Math.min(100, (state.duration_seconds - elapsed) / state.duration_seconds * 100));
       timerEl.textContent = remaining;
@@ -270,9 +276,10 @@
         advancing = true;
         document.getElementById('status').textContent = state.locked_by ? 'Next question...' : "Time's up — no one locked in!";
         advanceTimeoutId = setTimeout(async ()=>{
-          await api({action:'nextQuestion'});
+          const nextState = await api({action:'nextQuestion'});
           advancing = false;
           advanceTimeoutId = null;
+          render(nextState);
         }, 1800);
       }
     }

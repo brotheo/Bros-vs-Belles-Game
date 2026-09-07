@@ -71,6 +71,7 @@
 
   let currentQuestionId = null;
   let myPick = null;
+  let localStartTime = null;
 
   async function api(paramsObj){
     const url = API_URL + '?' + new URLSearchParams(paramsObj).toString();
@@ -91,6 +92,7 @@
     if(state.question.id !== currentQuestionId){
       currentQuestionId = state.question.id;
       myPick = null;
+      localStartTime = Date.now();
     }
 
     area.innerHTML = `
@@ -112,8 +114,8 @@
 
   function updateTimer(state){
     const el = document.getElementById('rep-timer');
-    if(!el || !state.round_active || !state.start_time) return;
-    const elapsed = (Date.now() - Number(state.start_time)) / 1000;
+    if(!el || !state.round_active || !localStartTime) return;
+    const elapsed = (Date.now() - localStartTime) / 1000;
     const remaining = Math.max(0, Math.ceil(state.duration_seconds - elapsed));
     el.textContent = remaining + 's left to vote';
     el.classList.toggle('urgent', remaining <= 5);
@@ -134,6 +136,7 @@
       currentQuestionId = null;
       myPick = null;
       lastLockedBy = '';
+      localStartTime = null;
       return;
     }
 
