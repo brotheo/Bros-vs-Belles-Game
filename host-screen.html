@@ -31,6 +31,7 @@
     cursor:pointer; margin-left:10px;
   }
   .controls button:hover{color:var(--text); border-color:var(--text-dim);}
+  .controls button:disabled{opacity:0.4; cursor:default;}
 
   .question-panel{
     width:100%; max-width:1200px; background:linear-gradient(180deg, var(--panel), #0c0c10);
@@ -86,9 +87,9 @@
   <div class="wordmark">BROS. VS. BELLES</div>
   <div class="controls">
     <button id="mute-btn" onclick="toggleMute()">🔊 sound</button>
-    <button onclick="startGame()">Start game</button>
-    <button onclick="skipQuestion()">Skip ⏭</button>
-    <button onclick="resetGame()">Reset game</button>
+    <button id="start-btn" onclick="startGame()">Start game</button>
+    <button id="skip-btn" onclick="skipQuestion()">Skip ⏭</button>
+    <button id="reset-btn" onclick="resetGame()">Reset game</button>
   </div>
 </div>
 
@@ -123,8 +124,50 @@
   let pollTimer = null;
   let lastLockedBy = '';
   let lastScores = {};
+  let lastQuestionId = null;
+  let lastTickSecond = null;
+  let latestState = null;
   let advancing = false;
   let advanceTimeoutId = null;
+  let actionBusy = false;
+  let writeGen = 0;
+  let lastStartMs = 0;
+  let pollInFlight = false;
+  let serverOffset = 0;
+  let lastSyncAt = 0;
+
+  function parseStartTime(value){
+    if(value === '' || value == null) return 0;
+    if(typeof value === 'number' && Number.isFinite(value)) return value > 1e11 ? value : value * 1000;
+    const str = String(value);
+    const prefixed = str.match(/ms:(\d+)/);
+    if(prefixed) return Number(prefixed[1]);
+    const num = Number(str);
+    if(Number.isFinite(num) && num > 1e11) return num;
+    if(Number.isFinite(num) && num > 1e9) return num * 1000;
+    const parsed = Date.parse(str);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  function noteServerNow(serverNow){
+    if(typeof serverNow === 'number' && serverNow > 0){
+      serverOffset = serverNow - Date.now();
+      lastSyncAt = Date.now();
+    }
+  }
+  function nowMs(){ return Date.now() + serverOffset; }
+  function remainingSeconds(state){
+    if(!state) return 0;
+    const start = parseStartTime(state.start_time);
+    const dur = Number(state.duration_seconds || 25);
+    if(start > 0) return Math.max(0, dur - (nowMs() - start) / 1000);
+    if(typeof state.remaining_seconds === 'number'){
+      return Math.max(0, state.remaining_seconds - (nowMs() - lastSyncAt) / 1000);
+    }
+    return 0;
+  }
+  function esc(s){
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
 
   function getCtx(){
     if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -158,54 +201,101 @@
   }
 
   async function api(params){
-    const url = API_URL + '?' + new URLSearchParams(params).toString();
-    const res = await fetch(url);
+    const url = API_URL + '?' + new URLSearchParams(Object.assign({}, params, { _: String(Date.now()) })).toString();
+    const res = await fetch(url, { cache: 'no-store' });
     return res.json();
   }
 
-  async function startGame(){
+  function clearAdvance(){
     advancing = false;
     if(advanceTimeoutId){ clearTimeout(advanceTimeoutId); advanceTimeoutId = null; }
-    const state = await api({action:'nextQuestion'});
-    render(state);
-    if(!pollTimer) pollTimer = setInterval(poll, 1000);
+  }
+
+  function isStaleState(state){
+    const start = parseStartTime(state.start_time);
+    if(state.finished || !state.question) return false;
+    return lastStartMs > 0 && start > 0 && start < lastStartMs;
+  }
+  function rememberStart(state){
+    if(state.finished || !state.question) lastStartMs = 0;
+    else {
+      const start = parseStartTime(state.start_time);
+      if(start > lastStartMs) lastStartMs = start;
+    }
+  }
+
+  async function runAction(params){
+    const myWrite = ++writeGen;
+    clearAdvance();
+    const state = await api(params);
+    if(myWrite !== writeGen) return;
+    applyState(state);
+  }
+
+  async function startGame(){
+    if(actionBusy) return;
+    const state = latestState;
+    if(state && state.question && !state.finished) return;
+    actionBusy = true;
+    try{
+      if(state && state.finished){
+        await runAction({ action: 'resetGame' });
+      }
+      await runAction({ action: 'nextQuestion' });
+      ensureLoops();
+    } finally {
+      actionBusy = false;
+    }
   }
 
   async function skipQuestion(){
-    advancing = false;
-    if(advanceTimeoutId){ clearTimeout(advanceTimeoutId); advanceTimeoutId = null; }
-    const state = await api({action:'nextQuestion'});
-    render(state);
-    if(!pollTimer) pollTimer = setInterval(poll, 1000);
+    if(actionBusy) return;
+    if(!latestState || !latestState.question || latestState.finished) return;
+    if(!confirm('Skip this question?')) return;
+    actionBusy = true;
+    try{
+      await runAction({ action: 'nextQuestion' });
+      ensureLoops();
+    } finally {
+      actionBusy = false;
+    }
   }
 
   async function resetGame(){
-    advancing = false;
-    if(advanceTimeoutId){ clearTimeout(advanceTimeoutId); advanceTimeoutId = null; }
-    await api({action:'resetGame'});
-    lastQuestionId = null;
-    lastLockedBy = '';
-    localStartTime = null;
+    if(actionBusy) return;
+    if(!confirm('Reset scores, votes, and the question deck?')) return;
+    actionBusy = true;
+    try{
+      await runAction({ action: 'resetGame' });
+      lastQuestionId = null;
+      lastLockedBy = '';
+      lastTickSecond = null;
+      showIdle();
+      poll(true);
+    } finally {
+      actionBusy = false;
+    }
+  }
+
+  function showIdle(){
     document.getElementById('q-counter').textContent = '';
     document.getElementById('category').textContent = 'waiting to start';
     document.getElementById('question-text').textContent = 'Click "Start game" to begin';
     document.getElementById('options').innerHTML = '';
     document.getElementById('timer').textContent = '--';
     document.getElementById('timer-bar').style.width = '100%';
+    document.getElementById('timer').classList.remove('urgent');
+    document.getElementById('timer-bar').classList.remove('urgent');
     document.getElementById('status').textContent = '';
     document.getElementById('bros-check').classList.remove('hit');
     document.getElementById('belles-check').classList.remove('hit');
-    poll();
   }
 
   function renderGroups(groups){
-    const houses = {Bros:[], Belles:[]};
-    groups.forEach(g => houses[g.house].push(g));
-    const brosTotal = houses.Bros.reduce((a,g)=>a+Number(g.score),0);
-    const bellesTotal = houses.Belles.reduce((a,g)=>a+Number(g.score),0);
-
-    bumpIfChanged('bros-total', brosTotal);
-    bumpIfChanged('belles-total', bellesTotal);
+    const houses = { Bros: [], Belles: [] };
+    (groups || []).forEach(g => { if(houses[g.house]) houses[g.house].push(g); });
+    bumpIfChanged('bros-total', houses.Bros.reduce((a,g)=>a+Number(g.score),0));
+    bumpIfChanged('belles-total', houses.Belles.reduce((a,g)=>a+Number(g.score),0));
   }
 
   function bumpIfChanged(id, value){
@@ -218,72 +308,150 @@
     lastScores[id] = value;
   }
 
-  let lastQuestionId = null;
-  let localStartTime = null;
-
-  async function poll(){
-    let state;
-    try{ state = await api({action:'getState'}); } catch(e){ return; }
-    render(state);
+  function updateButtons(state){
+    const inRound = !!(state && state.question && !state.finished);
+    document.getElementById('start-btn').disabled = inRound;
+    document.getElementById('start-btn').textContent = (state && state.finished) ? 'Play again' : 'Start game';
+    document.getElementById('skip-btn').disabled = !inRound;
   }
 
-  function render(state){
-    if(!state.question){
-      renderGroups(state.groups || []);
+  function scheduleAdvance(delay){
+    if(advancing) return;
+    advancing = true;
+    advanceTimeoutId = setTimeout(async ()=>{
+      const myWrite = ++writeGen;
+      try{
+        const nextState = await api({ action: 'nextQuestion' });
+        if(myWrite !== writeGen) return;
+        advancing = false;
+        advanceTimeoutId = null;
+        applyState(nextState);
+      } catch(e){
+        advancing = false;
+        advanceTimeoutId = null;
+      }
+    }, delay);
+  }
+
+  function considerAdvance(state){
+    if(advancing || !state || state.finished || !state.question) return;
+    if(state.locked_by){
+      scheduleAdvance(1800);
+      return;
+    }
+    const start = parseStartTime(state.start_time);
+    const canTrust = start > 0 || typeof state.remaining_seconds === 'number';
+    if(canTrust && remainingSeconds(state) <= 0) scheduleAdvance(1500);
+  }
+
+  function paintTimer(){
+    const state = latestState;
+    const timerEl = document.getElementById('timer');
+    const barEl = document.getElementById('timer-bar');
+    if(!state || !state.question || state.finished){
+      return;
+    }
+    const dur = Number(state.duration_seconds || 25);
+    const rem = remainingSeconds(state);
+    const shown = Math.ceil(rem);
+    const pct = Math.max(0, Math.min(100, rem / dur * 100));
+    timerEl.textContent = shown;
+    barEl.style.width = pct + '%';
+    const urgent = shown <= 5 && rem > 0;
+    timerEl.classList.toggle('urgent', urgent);
+    barEl.classList.toggle('urgent', urgent);
+    if(urgent && shown !== lastTickSecond){
+      lastTickSecond = shown;
+      playTick();
+    }
+    if(rem <= 0){
+      if(!state.locked_by && document.getElementById('status').textContent.indexOf('got it') === -1){
+        document.getElementById('status').textContent = "Time's up — no one locked in!";
+      } else if(state.locked_by){
+        document.getElementById('status').textContent = document.getElementById('status').textContent || 'Next question...';
+      }
+      considerAdvance(state);
+    }
+  }
+
+  async function poll(force){
+    if(pollInFlight && !force) return;
+    pollInFlight = true;
+    const seenWrite = writeGen;
+    try{
+      const state = await api({ action: 'getState' });
+      if(seenWrite !== writeGen) return;
+      applyState(state);
+    } catch(e){
+    } finally {
+      pollInFlight = false;
+    }
+  }
+
+  function applyState(state){
+    if(!state || state.error) return;
+    if(!Array.isArray(state.groups)) return;
+    if(isStaleState(state)) return;
+    noteServerNow(state.server_now);
+    rememberStart(state);
+    latestState = state;
+    updateButtons(state);
+    renderGroups(state.groups);
+
+    if(state.finished){
+      lastQuestionId = null;
+      document.getElementById('q-counter').textContent = 'Final scores';
+      document.getElementById('category').textContent = 'game over';
+      document.getElementById('question-text').textContent = 'All questions done — Play again to start a new match';
+      document.getElementById('options').innerHTML = '';
+      document.getElementById('timer').textContent = '0';
+      document.getElementById('timer-bar').style.width = '0%';
+      document.getElementById('status').textContent = 'Thanks for playing!';
+      clearAdvance();
       return;
     }
 
-    if(state.question.id !== lastQuestionId){
-      lastQuestionId = state.question.id;
-      localStartTime = Date.now();
+    if(!state.question){
+      lastQuestionId = null;
+      showIdle();
+      updateButtons(state);
+      return;
+    }
+
+    const qid = String(state.question.id);
+    if(qid !== lastQuestionId){
+      lastQuestionId = qid;
+      lastTickSecond = null;
+      lastLockedBy = '';
       document.getElementById('bros-check').classList.remove('hit');
       document.getElementById('belles-check').classList.remove('hit');
       document.getElementById('status').textContent = '';
+      document.getElementById('q-counter').textContent = 'Question ' + state.question_number + ' of ' + state.total_questions;
+      document.getElementById('category').textContent = state.question.category;
+      document.getElementById('question-text').textContent = state.question.question;
+      document.getElementById('options').innerHTML = state.question.options.map(o =>
+        '<div class="option">' + esc(o) + '</div>').join('');
     }
-
-    document.getElementById('q-counter').textContent = 'Question ' + state.question_number + ' of ' + state.total_questions;
-    document.getElementById('category').textContent = state.question.category;
-    document.getElementById('question-text').textContent = state.question.question;
-    document.getElementById('options').innerHTML = state.question.options.map(o =>
-      `<div class="option">${o}</div>`).join('');
-
-    renderGroups(state.groups);
 
     if(state.locked_by && state.locked_by !== lastLockedBy){
       playCorrect();
-      const g = state.groups.find(x=>x.group_id===state.locked_by);
+      const g = (state.groups || []).find(x => x.group_id === state.locked_by);
       document.getElementById('status').textContent = g ? (g.display_name + ' got it! +100') : 'Correct!';
       if(state.locked_house === 'Bros') document.getElementById('bros-check').classList.add('hit');
       if(state.locked_house === 'Belles') document.getElementById('belles-check').classList.add('hit');
     }
-    lastLockedBy = state.locked_by;
-
-    const timerEl = document.getElementById('timer');
-    const barEl = document.getElementById('timer-bar');
-
-    if(state.round_active && localStartTime){
-      const elapsed = (Date.now() - localStartTime) / 1000;
-      const remaining = Math.max(0, Math.ceil(state.duration_seconds - elapsed));
-      const pct = Math.max(0, Math.min(100, (state.duration_seconds - elapsed) / state.duration_seconds * 100));
-      timerEl.textContent = remaining;
-      barEl.style.width = pct + '%';
-      const urgent = remaining <= 5 && remaining > 0;
-      timerEl.classList.toggle('urgent', urgent);
-      barEl.classList.toggle('urgent', urgent);
-      if(urgent) playTick();
-
-      if(remaining <= 0 && !advancing){
-        advancing = true;
-        document.getElementById('status').textContent = state.locked_by ? 'Next question...' : "Time's up — no one locked in!";
-        advanceTimeoutId = setTimeout(async ()=>{
-          const nextState = await api({action:'nextQuestion'});
-          advancing = false;
-          advanceTimeoutId = null;
-          render(nextState);
-        }, 1800);
-      }
-    }
+    lastLockedBy = state.locked_by || '';
+    paintTimer();
+    considerAdvance(state);
   }
+
+  function ensureLoops(){
+    if(!pollTimer) pollTimer = setInterval(() => poll(false), 1000);
+  }
+
+  ensureLoops();
+  setInterval(paintTimer, 100);
+  poll(true);
 </script>
 
 </body>

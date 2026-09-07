@@ -54,10 +54,11 @@
 <script>
   const API_URL = "https://script.google.com/macros/s/AKfycbzopg2EZMulQXRc8Y_0zfne-S62L9CUNvm6laSCCV4fpjsddUDCUFYUXErvyWOcv3uWkg/exec";
   const params = new URLSearchParams(window.location.search);
-  const house = (params.get('house') || '').toLowerCase() === 'belles' ? 'Belles' : 'Bros';
+  const houseParam = (params.get('house') || '').toLowerCase();
+  const house = houseParam === 'belles' ? 'Belles' : houseParam === 'bros' ? 'Bros' : '';
 
-  document.getElementById('house-title').textContent = house + ' Audience';
-  document.getElementById('house-title').className = 'house-title ' + house.toLowerCase();
+  document.getElementById('house-title').textContent = house ? (house + ' Audience') : 'Open this page from your house QR code';
+  if(house) document.getElementById('house-title').className = 'house-title ' + house.toLowerCase();
 
   function getVoterId(){
     let id = localStorage.getItem('bvb_voter_id');
@@ -69,39 +70,88 @@
   }
   const voterId = getVoterId();
 
-  let currentQuestionId = null;
+  let renderedQid = null;
+  let closedQid = null;
   let myPick = null;
-  let localStartTime = null;
+  let latestState = null;
+  let writeGen = 0;
+  let lastStartMs = 0;
+  let pollInFlight = false;
+  let serverOffset = 0;
+  let lastSyncAt = 0;
+
+  function parseStartTime(value){
+    if(value === '' || value == null) return 0;
+    if(typeof value === 'number' && Number.isFinite(value)) return value > 1e11 ? value : value * 1000;
+    const str = String(value);
+    const prefixed = str.match(/ms:(\d+)/);
+    if(prefixed) return Number(prefixed[1]);
+    const num = Number(str);
+    if(Number.isFinite(num) && num > 1e11) return num;
+    if(Number.isFinite(num) && num > 1e9) return num * 1000;
+    const parsed = Date.parse(str);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  function noteServerNow(serverNow){
+    if(typeof serverNow === 'number' && serverNow > 0){
+      serverOffset = serverNow - Date.now();
+      lastSyncAt = Date.now();
+    }
+  }
+  function nowMs(){ return Date.now() + serverOffset; }
+  function remainingSeconds(state){
+    if(!state) return 0;
+    const start = parseStartTime(state.start_time);
+    const dur = Number(state.duration_seconds || 25);
+    if(start > 0) return Math.max(0, dur - (nowMs() - start) / 1000);
+    if(typeof state.remaining_seconds === 'number'){
+      return Math.max(0, state.remaining_seconds - (nowMs() - lastSyncAt) / 1000);
+    }
+    return 0;
+  }
+  function isStaleState(state){
+    const start = parseStartTime(state.start_time);
+    if(state.finished || !state.question) return false;
+    return lastStartMs > 0 && start > 0 && start < lastStartMs;
+  }
+  function rememberStart(state){
+    if(state.finished || !state.question) lastStartMs = 0;
+    else {
+      const start = parseStartTime(state.start_time);
+      if(start > lastStartMs) lastStartMs = start;
+    }
+  }
 
   async function api(paramsObj){
-    const url = API_URL + '?' + new URLSearchParams(paramsObj).toString();
-    const res = await fetch(url);
+    const url = API_URL + '?' + new URLSearchParams(Object.assign({}, paramsObj, { _: String(Date.now()) })).toString();
+    const res = await fetch(url, { cache: 'no-store' });
     return res.json();
   }
 
   async function pickOption(option, btnEl){
+    if(!house) return;
+    if(!latestState || remainingSeconds(latestState) <= 0 || latestState.locked_by) return;
     myPick = option;
     document.querySelectorAll('.opt').forEach(b => b.classList.remove('picked'));
     btnEl.classList.add('picked');
-    document.getElementById('feedback').textContent = 'Vote counted — you can change it anytime.';
+    const fb = document.getElementById('feedback');
+    if(fb) fb.textContent = 'Vote counted — you can change it anytime.';
+    writeGen++;
     await api({ action: 'submitVote', house: house, voter_id: voterId, choice: option });
   }
 
   function renderQuestion(state){
     const area = document.getElementById('game-area');
-    if(state.question.id !== currentQuestionId){
-      currentQuestionId = state.question.id;
-      myPick = null;
-      localStartTime = Date.now();
-    }
-
-    area.innerHTML = `
-      <div class="category-tag">${state.question.category}</div>
-      <div class="question-text">${state.question.question}</div>
-      <div class="options" id="options"></div>
-      <div class="feedback" id="feedback">${myPick ? 'Vote counted — you can change it anytime.' : ''}</div>
-      <div class="rep-timer" id="rep-timer"></div>
-    `;
+    area.innerHTML =
+      '<div class="category-tag"></div>' +
+      '<div class="question-text"></div>' +
+      '<div class="options" id="options"></div>' +
+      '<div class="feedback" id="feedback"></div>' +
+      '<div class="rep-timer" id="rep-timer"></div>';
+    area.querySelector('.category-tag').textContent = state.question.category;
+    area.querySelector('.question-text').textContent = state.question.question;
+    const fb = document.getElementById('feedback');
+    if(myPick) fb.textContent = 'Vote counted — you can change it anytime.';
     const optsDiv = document.getElementById('options');
     state.question.options.forEach(opt => {
       const btn = document.createElement('button');
@@ -112,54 +162,95 @@
     });
   }
 
-  function updateTimer(state){
+  function updateTimer(){
     const el = document.getElementById('rep-timer');
-    if(!el || !state.round_active || !localStartTime) return;
-    const elapsed = (Date.now() - localStartTime) / 1000;
-    const remaining = Math.max(0, Math.ceil(state.duration_seconds - elapsed));
-    el.textContent = remaining + 's left to vote';
-    el.classList.toggle('urgent', remaining <= 5);
+    const state = latestState;
+    if(!el || !state || !state.question) return;
+    const rem = remainingSeconds(state);
+    const shown = Math.ceil(rem);
+    el.textContent = shown + 's left to vote';
+    el.classList.toggle('urgent', shown <= 5 && rem > 0);
+    if(rem <= 0) showClosed("Time's up — voting closed.");
   }
 
-  let lastLockedBy = '';
-  function showClosedForVote(displayName){
-    document.getElementById('game-area').innerHTML =
-      `<div class="closed-msg">${displayName || 'Your representative'} already answered — voting closed!</div>`;
+  function showWaiting(msg){
+    document.getElementById('game-area').innerHTML = '<div class="waiting">' + msg + '</div>';
+    renderedQid = null;
+    closedQid = null;
+    myPick = null;
+  }
+
+  function showClosed(msg){
+    const state = latestState;
+    const qid = state && state.question ? String(state.question.id) : '';
+    if(qid && closedQid === qid) return;
+    closedQid = qid;
+    renderedQid = qid || null;
+    document.getElementById('game-area').innerHTML = '<div class="closed-msg"></div>';
+    document.querySelector('.closed-msg').textContent = msg;
   }
 
   async function poll(){
-    let state;
-    try{ state = await api({action:'getState'}); } catch(e){ return; }
-
-    if(!state.round_active || !state.question){
-      document.getElementById('game-area').innerHTML = '<div class="waiting">Waiting for the next question...</div>';
-      currentQuestionId = null;
-      myPick = null;
-      lastLockedBy = '';
-      localStartTime = null;
-      return;
+    if(!house || pollInFlight) return;
+    pollInFlight = true;
+    const seenWrite = writeGen;
+    try{
+      const state = await api({ action: 'getState' });
+      if(seenWrite !== writeGen) return;
+      applyState(state);
+    } catch(e){
+    } finally {
+      pollInFlight = false;
     }
-
-    if(state.question.id !== currentQuestionId){
-      lastLockedBy = '';
-    }
-
-    const ownRepLocked = state.locked_by && (state.groups || []).find(g => g.group_id === state.locked_by && g.house === house);
-
-    if(ownRepLocked){
-      if(state.locked_by !== lastLockedBy){
-        lastLockedBy = state.locked_by;
-        showClosedForVote(ownRepLocked.display_name);
-      }
-      return;
-    }
-
-    renderQuestion(state);
-    updateTimer(state);
   }
 
-  poll();
-  setInterval(poll, 1000);
+  function applyState(state){
+    if(!state || state.error) return;
+    if(!Array.isArray(state.groups)) return;
+    if(isStaleState(state)) return;
+    noteServerNow(state.server_now);
+    rememberStart(state);
+    latestState = state;
+
+    if(state.finished){
+      showWaiting('Game over — wait for the host.');
+      return;
+    }
+    if(!state.question){
+      showWaiting('Waiting for the next question...');
+      return;
+    }
+
+    const qid = String(state.question.id);
+    const isNew = qid !== renderedQid;
+    if(isNew){
+      renderedQid = qid;
+      closedQid = null;
+      myPick = null;
+    }
+
+    if(state.locked_by){
+      const locker = (state.groups || []).find(g => g.group_id === state.locked_by);
+      showClosed((locker && locker.display_name ? locker.display_name : 'A representative') + ' already answered — voting closed!');
+      return;
+    }
+    if(remainingSeconds(state) <= 0){
+      showClosed("Time's up — voting closed.");
+      return;
+    }
+
+    if(closedQid === qid) return;
+    if(isNew || !document.getElementById('options')) renderQuestion(state);
+    updateTimer();
+  }
+
+  if(!house){
+    showWaiting('Scan the Bros Audience or Belles Audience QR code.');
+  } else {
+    poll();
+    setInterval(poll, 2000);
+    setInterval(updateTimer, 100);
+  }
 </script>
 
 </body>

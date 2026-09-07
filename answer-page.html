@@ -29,13 +29,22 @@
   .options{display:flex; flex-direction:column; gap:12px; width:100%; max-width:400px;}
   button.opt{
     font-family:'Cinzel', serif; font-size:16px; color:var(--text);
-    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    background:var(--panel); border:2px solid var(--line); border-radius:8px;
     padding:16px 10px; cursor:pointer;
   }
   button.opt:active{transform:scale(0.98);}
   button.opt:disabled{opacity:0.5;}
   button.opt.picked{border-color:var(--gold); color:var(--gold);}
-  button.opt.hint{box-shadow:0 0 0 2px var(--cyan) inset;}
+  button.opt.hint{
+    border-color:var(--cyan);
+    color:var(--cyan);
+    background:#102326;
+  }
+  .opt-label{display:block;}
+  .hint-tag{
+    display:block; font-size:10px; letter-spacing:0.08em; margin-top:8px;
+    color:var(--cyan); text-transform:uppercase;
+  }
   .feedback{margin-top:22px; font-size:16px; min-height:24px;}
   .feedback.good{color:var(--good);}
   .feedback.bad{color:var(--bad);}
@@ -48,7 +57,7 @@
 
 <div class="group-name" id="group-name">Loading…</div>
 <div class="house-tag" id="house-tag"></div>
-<div class="hint-legend">A glowing outline = your audience's top pick</div>
+<div class="hint-legend" id="hint-legend">Cyan outline = what your crowd is backing. Two outlines means a tie.</div>
 
 <div id="game-area">
   <div class="waiting">Waiting for the host to start...</div>
@@ -59,11 +68,58 @@
   const params = new URLSearchParams(window.location.search);
   const groupId = params.get('group') || '';
 
-  let muted = false;
   let audioCtx = null;
-  let currentQuestionId = null;
+  let renderedQid = null;
   let hasAnswered = false;
-  let localStartTime = null;
+  let latestState = null;
+  let writeGen = 0;
+  let lastStartMs = 0;
+  let pollInFlight = false;
+  let hintInFlight = false;
+  let serverOffset = 0;
+  let lastSyncAt = 0;
+
+  function parseStartTime(value){
+    if(value === '' || value == null) return 0;
+    if(typeof value === 'number' && Number.isFinite(value)) return value > 1e11 ? value : value * 1000;
+    const str = String(value);
+    const prefixed = str.match(/ms:(\d+)/);
+    if(prefixed) return Number(prefixed[1]);
+    const num = Number(str);
+    if(Number.isFinite(num) && num > 1e11) return num;
+    if(Number.isFinite(num) && num > 1e9) return num * 1000;
+    const parsed = Date.parse(str);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  function noteServerNow(serverNow){
+    if(typeof serverNow === 'number' && serverNow > 0){
+      serverOffset = serverNow - Date.now();
+      lastSyncAt = Date.now();
+    }
+  }
+  function nowMs(){ return Date.now() + serverOffset; }
+  function remainingSeconds(state){
+    if(!state) return 0;
+    const start = parseStartTime(state.start_time);
+    const dur = Number(state.duration_seconds || 25);
+    if(start > 0) return Math.max(0, dur - (nowMs() - start) / 1000);
+    if(typeof state.remaining_seconds === 'number'){
+      return Math.max(0, state.remaining_seconds - (nowMs() - lastSyncAt) / 1000);
+    }
+    return 0;
+  }
+  function isStaleState(state){
+    const start = parseStartTime(state.start_time);
+    if(state.finished || !state.question) return false;
+    return lastStartMs > 0 && start > 0 && start < lastStartMs;
+  }
+  function rememberStart(state){
+    if(state.finished || !state.question) lastStartMs = 0;
+    else {
+      const start = parseStartTime(state.start_time);
+      if(start > lastStartMs) lastStartMs = start;
+    }
+  }
 
   function getCtx(){
     if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -92,126 +148,232 @@
   }
 
   async function api(paramsObj){
-    const url = API_URL + '?' + new URLSearchParams(paramsObj).toString();
-    const res = await fetch(url);
+    const url = API_URL + '?' + new URLSearchParams(Object.assign({}, paramsObj, { _: String(Date.now()) })).toString();
+    const res = await fetch(url, { cache: 'no-store' });
     return res.json();
+  }
+
+  function setFeedback(text, kind){
+    const fb = document.getElementById('feedback');
+    if(!fb) return;
+    fb.textContent = text;
+    fb.className = 'feedback' + (kind ? ' ' + kind : '');
+  }
+
+  function disableOptions(){
+    document.querySelectorAll('.opt').forEach(b => { b.disabled = true; });
   }
 
   async function pickAnswer(choice, btnEl){
     if(hasAnswered) return;
+    const rem = remainingSeconds(latestState);
+    if(!latestState || !latestState.round_active || rem <= 0){
+      lockOutTimeUp();
+      return;
+    }
     hasAnswered = true;
-    document.querySelectorAll('.opt').forEach(b=>b.disabled=true);
+    disableOptions();
     btnEl.classList.add('picked');
 
-    const result = await api({action:'submitAnswer', group: groupId, choice: choice});
-    const fb = document.getElementById('feedback');
+    const myWrite = ++writeGen;
+    const result = await api({ action: 'submitAnswer', group: groupId, choice: choice });
+    if(myWrite !== writeGen) return;
 
     if(result.ok && result.result === 'correct'){
       playCorrect();
-      fb.textContent = "You got it! +100";
-      fb.className = 'feedback good';
+      setFeedback('You got it! +100', 'good');
     } else if(result.reason === 'already_answered'){
       playWrong();
-      fb.textContent = "Someone already locked in that one!";
-      fb.className = 'feedback bad';
+      setFeedback('Someone already locked in that one!', 'bad');
+    } else if(result.reason === 'busy'){
+      hasAnswered = false;
+      document.querySelectorAll('.opt').forEach(b => { b.disabled = false; });
+      btnEl.classList.remove('picked');
+      setFeedback('Server was busy — tap again.', 'bad');
+    } else if(result.reason === 'time_up' || result.reason === 'round_not_active'){
+      playWrong();
+      setFeedback("Time's up — too late to answer.", 'bad');
     } else {
       playWrong();
-      fb.textContent = "Locked in — waiting on the others.";
-      fb.className = 'feedback bad';
+      setFeedback('That option did not count.', 'bad');
     }
   }
 
   function renderQuestion(state){
     const area = document.getElementById('game-area');
-    if(state.question.id !== currentQuestionId){
-      currentQuestionId = state.question.id;
-      hasAnswered = false;
-      localStartTime = Date.now();
-    }
-
-    if(hasAnswered){
-      return;
-    }
-
-    area.innerHTML = `
-      <div class="category-tag">${state.question.category}</div>
-      <div class="question-text">${state.question.question}</div>
-      <div class="options" id="options"></div>
-      <div class="feedback" id="feedback"></div>
-      <div class="rep-timer" id="rep-timer"></div>
-    `;
+    area.innerHTML =
+      '<div class="category-tag"></div>' +
+      '<div class="question-text"></div>' +
+      '<div class="options" id="options"></div>' +
+      '<div class="feedback" id="feedback"></div>' +
+      '<div class="rep-timer" id="rep-timer"></div>';
+    area.querySelector('.category-tag').textContent = state.question.category;
+    area.querySelector('.question-text').textContent = state.question.question;
     const optsDiv = document.getElementById('options');
     state.question.options.forEach(opt => {
       const btn = document.createElement('button');
       btn.className = 'opt';
-      btn.textContent = opt;
+      btn.dataset.option = opt;
+      const label = document.createElement('span');
+      label.className = 'opt-label';
+      label.textContent = opt;
+      btn.appendChild(label);
       btn.onclick = () => pickAnswer(opt, btn);
       optsDiv.appendChild(btn);
     });
   }
 
-  function updateTimer(state){
+  function updateTimer(){
     const el = document.getElementById('rep-timer');
-    if(!el || !state.round_active || !localStartTime) return;
-    const elapsed = (Date.now() - localStartTime) / 1000;
-    const remaining = Math.max(0, Math.ceil(state.duration_seconds - elapsed));
-    el.textContent = remaining + 's left';
-    el.classList.toggle('urgent', remaining <= 5);
+    const state = latestState;
+    if(!el || !state || !state.question) return;
+    const rem = remainingSeconds(state);
+    const shown = Math.ceil(rem);
+    el.textContent = shown + 's left';
+    el.classList.toggle('urgent', shown <= 5 && rem > 0);
+    if(!hasAnswered && rem <= 0 && state.question) lockOutTimeUp();
   }
 
   function lockOutForOtherAnswer(displayName){
     hasAnswered = true;
-    document.querySelectorAll('.opt').forEach(b=>b.disabled=true);
+    disableOptions();
     playWrong();
-    const fb = document.getElementById('feedback');
-    if(fb){
-      fb.textContent = (displayName || 'The other side') + ' already locked in the answer!';
-      fb.className = 'feedback bad';
+    setFeedback((displayName || 'The other side') + ' already locked in the answer!', 'bad');
+  }
+
+  function lockOutTimeUp(){
+    hasAnswered = true;
+    disableOptions();
+    setFeedback("Time's up — waiting for the next question.", 'bad');
+  }
+
+  function hintOptions(hint){
+    if(!hint) return [];
+    if(Array.isArray(hint)) return hint;
+    if(typeof hint === 'string') return [hint];
+    return Array.isArray(hint.options) ? hint.options : [];
+  }
+
+  function applyHint(hint){
+    const picks = hintOptions(hint);
+    const tied = !!(hint && hint.tied);
+    const count = hint && Number(hint.count || 0);
+    document.querySelectorAll('.opt').forEach(btn => {
+      const on = picks.indexOf(btn.dataset.option) !== -1;
+      btn.classList.toggle('hint', on);
+      let tag = btn.querySelector('.hint-tag');
+      if(on){
+        if(!tag){
+          tag = document.createElement('span');
+          tag.className = 'hint-tag';
+          btn.appendChild(tag);
+        }
+        tag.textContent = tied
+          ? ('Tied crowd pick' + (count ? ' · ' + count + ' each' : ''))
+          : ('Crowd pick' + (count ? ' · ' + count : ''));
+      } else if(tag){
+        tag.remove();
+      }
+    });
+    const legend = document.getElementById('hint-legend');
+    if(legend){
+      if(!picks.length) legend.textContent = 'Waiting on your crowd — their top pick will light up in cyan.';
+      else if(tied) legend.textContent = 'Your crowd is split. Both cyan options are tied for the lead.';
+      else legend.textContent = 'Cyan = what your crowd is backing right now.';
     }
   }
 
-  function applyHint(hintText){
-    document.querySelectorAll('.opt').forEach(btn => {
-      btn.classList.toggle('hint', !!hintText && btn.textContent === hintText);
-    });
+  function myHouseHint(source){
+    if(!source) return null;
+    const me = (latestState && latestState.groups || []).find(g => g.group_id === groupId);
+    if(!me || !source[me.house]) return null;
+    return source[me.house];
+  }
+
+  async function pollHint(){
+    if(hintInFlight || hasAnswered || !renderedQid) return;
+    hintInFlight = true;
+    try{
+      const hint = await api({ action: 'getHint' });
+      if(!hint || !hint.ok) return;
+      if(String(hint.question_id) !== String(renderedQid)) return;
+      if(hint.locked_by && hint.locked_by !== groupId && !hasAnswered){
+        const winner = (latestState && latestState.groups || []).find(g => g.group_id === hint.locked_by);
+        lockOutForOtherAnswer(winner ? winner.display_name : null);
+        return;
+      }
+      if(!hasAnswered) applyHint(myHouseHint(hint.audience_hint));
+    } catch(e){
+    } finally {
+      hintInFlight = false;
+    }
+  }
+
+  function showWaiting(msg){
+    document.getElementById('game-area').innerHTML = '<div class="waiting">' + msg + '</div>';
+    renderedQid = null;
   }
 
   async function poll(){
-    let state;
-    try{ state = await api({action:'getState'}); } catch(e){ return; }
+    if(pollInFlight) return;
+    pollInFlight = true;
+    const seenWrite = writeGen;
+    try{
+      const state = await api({ action: 'getState' });
+      if(seenWrite !== writeGen) return;
+      applyState(state);
+    } catch(e){
+    } finally {
+      pollInFlight = false;
+    }
+  }
+
+  function applyState(state){
+    if(!state || state.error) return;
+    if(!Array.isArray(state.groups)) return;
+    if(isStaleState(state)) return;
+    noteServerNow(state.server_now);
+    rememberStart(state);
+    latestState = state;
 
     const me = (state.groups || []).find(g => g.group_id === groupId);
     document.getElementById('group-name').textContent = me ? me.display_name : ('Unknown group: ' + groupId);
     document.getElementById('house-tag').textContent = me ? (me.house + ' house · ' + me.score + ' pts') : '';
 
-    if(!state.round_active || !state.question){
-      if(!hasAnswered){
-        document.getElementById('game-area').innerHTML = '<div class="waiting">Waiting for the next question...</div>';
-      }
+    if(state.finished){
+      showWaiting('Game over — wait for the host.');
+      return;
+    }
+    if(!state.question){
+      showWaiting('Waiting for the next question...');
       return;
     }
 
-    if(state.question.id !== currentQuestionId){
+    const qid = String(state.question.id);
+    if(qid !== renderedQid){
+      renderedQid = qid;
       hasAnswered = false;
+      renderQuestion(state);
     }
-
-    renderQuestion(state);
 
     if(state.locked_by && state.locked_by !== groupId && !hasAnswered){
       const winner = (state.groups || []).find(g => g.group_id === state.locked_by);
       lockOutForOtherAnswer(winner ? winner.display_name : null);
+    } else if(!hasAnswered && remainingSeconds(state) <= 0){
+      lockOutTimeUp();
     }
 
-    if(!hasAnswered && me && state.audience_hint){
-      applyHint(state.audience_hint[me.house]);
-    }
     if(!hasAnswered){
-      updateTimer(state);
+      applyHint(myHouseHint(state.audience_hint));
     }
+    updateTimer();
   }
 
   poll();
-  setInterval(poll, 1000);
+  pollHint();
+  setInterval(poll, 2000);
+  setInterval(pollHint, 700);
+  setInterval(updateTimer, 100);
 </script>
 
 </body>
